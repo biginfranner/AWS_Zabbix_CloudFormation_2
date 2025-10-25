@@ -1,0 +1,2 @@
+# AWS_Zabbix_CloudFormation_2
+AWS構築練習として、CloudFormationを使用して、Zabbix監視入りの簡易構成を作成しました。
