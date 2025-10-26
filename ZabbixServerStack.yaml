@@ -1,0 +1,819 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Zabbix kanshi APP/DB Stack
+
+Parameters:
+  ZabbixDBName:
+    Type: String
+    Default: zabbixdb
+  ZabbixDBAdminUsername:
+    Type: String
+    Default: admin
+  ZabbixDBAdminPassword:
+    Type: String
+    NoEcho: true
+ # Amazon Linux 2023 AMI
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  AppDBName:
+    Type: String
+    Default: appdb
+  AppDBAdminUsername:
+    Type: String
+    Default: admin
+  AppDBAdminPassword:
+    Type: String
+    NoEcho: true
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+
+Resources:
+  # VPC & Subnets
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: WebSystemVPC
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: ZabbixIGW
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # EIP for NAT Gateway
+  NatEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: NatEIP
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags:
+        - Key: Name
+          Value: ZabbixNATGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: ap-northeast-1a
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: PublicSubnetA
+
+  PublicSubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: ap-northeast-1c
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: PublicSubnetC
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.10.0/24
+      AvailabilityZone: ap-northeast-1a
+      Tags:
+        - Key: Name
+          Value: PrivateSubnetA
+
+  PrivateSubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: ap-northeast-1c
+      Tags:
+        - Key: Name
+          Value: PrivateSubnetC
+
+
+
+  # Public Subnet Route Table
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: ZabbixPublicRT
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetCRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetC
+      RouteTableId: !Ref PublicRouteTable
+
+
+  # Private Subnets Route Table
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: PrivateRouteTable
+
+  # Route to NAT
+  PrivateRouteToNAT:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  # Associate PrivateSubnetA
+  PrivateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  # Associate PrivateSubnetC
+  PrivateSubnetCRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetC
+      RouteTableId: !Ref PrivateRouteTable
+
+
+  ########################################
+  # Zabbix: Security Groups
+  ########################################
+  ZabbixServerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Zabbix Server Security Group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0   # WebUI
+        - IpProtocol: tcp
+          FromPort: 10051
+          ToPort: 10051
+          CidrIp: 10.0.0.0/16 # 監視先からServer/Proxy接続 (VPC内)
+
+  ZabbixDBSetupEC2SG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Zabbix Init EC2 Security Group
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: ZabbixDBSetupEC2SG
+
+  ZabbixRDSSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Zabbix RDS Security Group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref ZabbixDBSetupEC2SG
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref ZabbixServerSG
+      Tags:
+        - Key: Name
+          Value: ZabbixRDSSG
+
+  ########################################
+  # RDS for Zabbix
+  ########################################
+  ZabbixDBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Zabbix DB Subnet Group
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetC
+
+  ZabbixDBParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: "Zabbix RDS parameter group"
+      Family: mysql8.0   # RDS のデフォルトは 8.0 系なのでこれでOK
+      Parameters:
+        log_bin_trust_function_creators: "1"
+
+  ZabbixRDS:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: zabbix-db
+      AllocatedStorage: 20
+      DBInstanceClass: db.t3.micro
+      Engine: mysql
+      MasterUsername: !Ref ZabbixDBAdminUsername
+      MasterUserPassword: !Ref ZabbixDBAdminPassword
+      DBName: !Ref ZabbixDBName
+      PubliclyAccessible: false
+      VPCSecurityGroups:
+       - !Ref ZabbixRDSSG
+      DBSubnetGroupName: !Ref ZabbixDBSubnetGroup
+      DBParameterGroupName: !Ref ZabbixDBParameterGroup
+
+  # ==========================================
+  # RDS Setup EC2 (Initialization of Zabbix DB)
+  # ==========================================
+   # RDS初期化用EC2（IAMロール）
+   #cfn-signal コマンドの実行時、内部で cloudformation:SignalResource API を呼び出す。
+   #権限がなければ AccessDenied になり、CloudFormationはシグナルを受け取れない。
+  ZabbixDBSetupEC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: AllowCFNSignal
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:SignalResource
+                Resource: "*"
+                
+  ZabbixDBSetupEC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref ZabbixDBSetupEC2Role
+
+
+  DBSetupInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: ZabbixRDS
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT30M
+    Properties:
+      InstanceType: t3.micro
+      SubnetId: !Ref PublicSubnetA
+      SecurityGroupIds:
+        - !Ref ZabbixDBSetupEC2SG
+      IamInstanceProfile: !Ref ZabbixDBSetupEC2InstanceProfile
+      InstanceInitiatedShutdownBehavior: terminate
+      ImageId: !Ref LatestAmiId
+      Tags:
+        - Key: Name
+          Value: ZabbixDBSetupEC2
+      UserData:
+        Fn::Base64: !Sub |
+            #!/bin/bash
+            dnf update -y
+            set -xe
+            dnf install -y mariadb105
+
+            #=====================================================
+            # DB情報を変数化（CloudFormationで展開される）
+            #=====================================================
+            RDS_HOST="${ZabbixRDS.Endpoint.Address}"
+            DB_ADMIN="${ZabbixDBAdminUsername}"
+            DB_ADMIN_PASS="${ZabbixDBAdminPassword}"
+            REGION=${AWS::Region}
+
+
+            # 永続化してログイン後も参照できるようにする
+            echo "export RDS_HOST=$RDS_HOST" >> /etc/profile.d/zabbix_env.sh
+            echo "export DB_ADMIN=$DB_ADMIN" >> /etc/profile.d/zabbix_env.sh
+            echo "export DB_ADMIN_PASS=$DB_ADMIN_PASS" >> /etc/profile.d/zabbix_env.sh
+
+            # デバッグ用ログ
+            echo "RDS_HOST=$RDS_HOST" > /home/ec2-user/rds_info.txt
+            echo "DB_ADMIN=$DB_ADMIN" >> /home/ec2-user/rds_info.txt
+
+
+            # SQLファイル作成
+            cat <<EOF > /tmp/create.sql
+            CREATE DATABASE IF NOT EXISTS zabbix CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;
+            EOF
+
+            mysql -h "$RDS_HOST" -u "$DB_ADMIN" -p"$DB_ADMIN_PASS" < /tmp/create.sql
+
+            # Zabbix 初期スキーマ投入
+            rpm -Uvh https://repo.zabbix.com/zabbix/7.4/release/amazonlinux/2023/noarch/zabbix-release-latest.amzn2023.noarch.rpm
+            dnf clean all
+            dnf install -y zabbix-server-mysql
+            dnf install -y zabbix-sql-scripts
+
+            # QL を実行して Zabbix の初期テーブルやデータを作成
+            # RDS に DB (zabbix) とアプリ用ユーザー (zabbixuser) を作成
+            echo "Importing Zabbix initial schema..."
+            zcat /usr/share/zabbix/sql-scripts/mysql/server.sql.gz | mysql -h "$RDS_HOST" -u "$DB_ADMIN" -p"$DB_ADMIN_PASS" zabbix
+
+            sudo sed -i "s|^\s*#\?\s*DBUser=.*|DBUser=$DB_ADMIN|" /etc/zabbix/zabbix_server.conf
+            sudo sed -i "s|^\s*#\?\s*DBPassword=.*|DBPassword=$DB_ADMIN_PASS|" /etc/zabbix/zabbix_server.conf
+            sudo sed -i "s|^\s*#\?\s*DBHost=.*|DBHost=$RDS_HOST|" /etc/zabbix/zabbix_server.conf
+
+            sleep 60
+            sudo systemctl enable zabbix-server
+            sudo systemctl start zabbix-server
+
+
+            # RDS接続を待機
+            for i in {1..10}; do
+              echo "Waiting for RDS to be available... attempt $i"
+              mysql -h "$RDS_HOST" -u "$DB_ADMIN" -p"$DB_ADMIN_PASS" -e "SELECT 1;" && break
+              sleep 60
+            done
+
+              #cfn-signal は 「UserDataの処理が終わったよ」という合図 をスタックに送る
+              #失敗シグナル送信
+            if [ "$i" -eq 10 ]; then
+              echo "RDS did not become ready in time"
+              /opt/aws/bin/cfn-signal --exit-code 1 --stack ${AWS::StackName} --resource DBSetupInstance --region ${AWS::Region}
+              exit 1
+            fi
+
+            echo "Zabbix DB initialization complete."
+
+              # --- RDS初期化が完了したら ---
+
+              # CloudFormationに「成功したよ」とシグナルを送る
+            /opt/aws/bin/cfn-signal --exit-code 0 --stack ${AWS::StackName} --resource DBSetupInstance --region ${AWS::Region}
+
+            sleep 60
+            shutdown -h now
+
+  ########################################
+  # Zabbix Server EC2 + EIP
+  ########################################
+  ZabbixServerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+                
+  ZabbixServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref ZabbixServerRole
+
+  ZabbixServerInstance:
+      Type: AWS::EC2::Instance
+      Properties:
+        InstanceType: t3.micro
+        SubnetId: !Ref PublicSubnetA
+        SecurityGroupIds:
+          - !Ref ZabbixServerSG
+        IamInstanceProfile: !Ref ZabbixServerInstanceProfile
+        ImageId: !Ref LatestAmiId
+        Tags:
+          - Key: Name
+            Value: ZabbixServer
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash -xe
+            dnf install -y php php-mysqlnd mariadb105 httpd
+
+            RDS_HOST="${ZabbixRDS.Endpoint.Address}"
+            DB_ADMIN="${ZabbixDBAdminUsername}"
+            DB_ADMIN_PASS="${ZabbixDBAdminPassword}"
+
+            # Zabbix リポジトリ
+            rpm -Uvh https://repo.zabbix.com/zabbix/7.4/release/amazonlinux/2023/noarch/zabbix-release-latest.amzn2023.noarch.rpm
+            dnf clean all
+            dnf install -y zabbix-server-mysql zabbix-sql-scripts zabbix-web-mysql zabbix-apache-conf zabbix-agent
+
+            sleep 60
+
+            # DB接続設定
+            sudo sed -i "s|^\s*#\?\s*DBUser=.*|DBUser=$DB_ADMIN|" /etc/zabbix/zabbix_server.conf
+            sudo sed -i "s|^\s*#\?\s*DBPassword=.*|DBPassword=$DB_ADMIN_PASS|" /etc/zabbix/zabbix_server.conf
+            sudo sed -i "s|^\s*#\?\s*DBHost=.*|DBHost=$RDS_HOST|" /etc/zabbix/zabbix_server.conf
+
+            systemctl enable zabbix-server zabbix-agent httpd
+            systemctl start zabbix-server zabbix-agent httpd
+
+            # 日本語フォントをインストール
+            sudo dnf install -y ipa-gothic-fonts
+
+            # Zabbix WebUI 用フォントを設定
+            sudo sed -i "s|^\s*#\?\s*\$ZBX_GRAPH_FONT_NAME\s*=.*|\$ZBX_GRAPH_FONT_NAME = 'ipagp';|" /etc/zabbix/web/zabbix.conf.php
+
+            # Webサーバー再起動
+            sudo systemctl restart httpd
+
+  ZabbixServerEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: ZabbixServerEIP
+
+  ZabbixServerEIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref ZabbixServerInstance
+      AllocationId: !GetAtt ZabbixServerEIP.AllocationId #EC2にひも付ける
+
+########################################
+# App: Security Groups
+########################################
+
+  AppALBSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB Security Group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: AppALBSG
+
+      #ALBからのHTTPリクエストをEC2のポート3000で受け取る。ALB→EC2(アプリ) 通信を許可
+      #Zabbix Server への Active チェック送信（10051）
+  AppEC2SG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App EC2 Security Group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          SourceSecurityGroupId: !Ref AppALBSG
+        - IpProtocol: tcp
+          FromPort: 10051
+          ToPort: 10051
+          CidrIp: 10.0.0.0/16   # VPC 内通信
+        - IpProtocol: tcp
+          FromPort: 10050
+          ToPort: 10050
+          CidrIp: 10.0.0.0/16   # VPC 内通信
+      Tags:
+        - Key: Name
+          Value: AppEC2SG
+
+  AppRDSSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App RDS Security Group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref AppEC2SG
+      Tags:
+        - Key: Name
+          Value: AppRDSSG
+
+  ########################################
+  # App RDS (separate DB for app)
+  ########################################
+  AppDBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: App DB Subnet Group
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetC
+
+
+  AppRDS:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: app-db
+      AllocatedStorage: 20
+      DBInstanceClass: db.t3.micro
+      Engine: mysql
+      MasterUsername: !Ref AppDBAdminUsername
+      MasterUserPassword: !Ref AppDBAdminPassword
+      DBName: !Ref AppDBName
+      PubliclyAccessible: false
+      VPCSecurityGroups:
+        - !Ref AppRDSSG
+      DBSubnetGroupName: !Ref AppDBSubnetGroup
+      DBParameterGroupName: !Ref ZabbixDBParameterGroup
+
+  ########################################
+  # ALB and TargetGroup
+  ########################################
+  AppALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: AppALB
+      Scheme: internet-facing
+      Subnets:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetC
+      SecurityGroups:
+        - !Ref AppALBSG
+      Tags:
+        - Key: Name
+          Value: AppALB
+
+
+  AppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: AppTG
+      Port: 3000
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: instance
+      Targets:
+        - Id: !Ref AppEC2InstanceA
+        - Id: !Ref AppEC2InstanceC
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /
+      HealthCheckPort: '3000'
+
+  AppListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref AppALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AppTargetGroup
+
+########################################
+# Launch Configuration / AutoScaling Group for App Servers
+########################################
+  AppServerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  AppServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref AppServerRole
+
+  AppEC2InstanceA:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiId
+      SubnetId: !Ref PrivateSubnetA   # プライベートサブネット
+      SecurityGroupIds:
+        - !Ref AppEC2SG
+      IamInstanceProfile: !Ref AppServerInstanceProfile
+      Tags:
+        - Key: Name
+          Value: AppServerA
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          dnf update -y
+          # Install Node.js (example) and Zabbix Agent
+          curl -fsSL https://rpm.nodesource.com/setup_18.x | bash -
+          dnf install -y nodejs mariadb105
+          
+          # AppRDS 情報を環境変数に永続化
+          echo "export APP_DB_HOST=${AppRDS.Endpoint.Address}" >> /etc/profile.d/app_env.sh
+          echo "export APP_DB_USER=${AppDBAdminUsername}" >> /etc/profile.d/app_env.sh
+          echo "export APP_DB_PASS=${AppDBAdminPassword}" >> /etc/profile.d/app_env.sh
+          echo "export APP_DB_NAME=${AppDBName}" >> /etc/profile.d/app_env.sh
+
+
+          # Node.js アプリ用の .env にも書き込み
+          mkdir -p /home/ec2-user/app
+          cat <<EOF > /home/ec2-user/app/.env
+          DB_HOST=${AppRDS.Endpoint.Address}
+          DB_USER=${AppDBAdminUsername}
+          DB_PASS=${AppDBAdminPassword}
+          DB_NAME=${AppDBName}
+          EOF
+          chown ec2-user:ec2-user /home/ec2-user/app/.env
+
+          # サンプルAPI配置
+          mkdir -p /home/ec2-user/sample-api
+          cat << 'EOF' > /home/ec2-user/sample-api/index.js
+          const http = require('http');
+          const port = 3000;
+          const server = http.createServer((req, res) => {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ message: "Hello World from AppServerA!" }));
+          
+          });
+          server.listen(port, () => {
+          });
+          EOF
+
+
+          # systemdで自動起動
+          cat << 'EOF' > /etc/systemd/system/sample-api.service
+          [Unit]
+          Description=Sample Node.js Hello World API
+          After=network.target
+
+          [Service]
+          ExecStart=/usr/bin/node /home/ec2-user/sample-api/index.js
+          Restart=always
+          User=ec2-user
+          Environment=PATH=/usr/bin:/usr/local/bin
+          WorkingDirectory=/home/ec2-user/sample-api
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          systemctl daemon-reexec
+          systemctl enable sample-api
+          systemctl start sample-api
+
+
+          # Zabbix Agent インストール
+          rpm -Uvh https://repo.zabbix.com/zabbix/7.4/release/amazonlinux/2023/noarch/zabbix-release-latest.amzn2023.noarch.rpm || true
+          dnf clean all || true
+          dnf install -y zabbix-agent || true
+
+            # 固定 EC2 のホスト名
+          ZABBIX_SERVER_IP="${ZabbixServerInstance.PrivateIp}"
+          ZABBIX_HOSTNAME="AppEC2A"           
+          ZABBIX_HOST_METADATA="appserver"
+
+          sudo sed -i "s|^\s*#\?\s*Server=.*|Server=$ZABBIX_SERVER_IP|" /etc/zabbix/zabbix_agentd.conf
+          sudo sed -i "s|^\s*#\?\s*ServerActive=.*|ServerActive=$ZABBIX_SERVER_IP|" /etc/zabbix/zabbix_agentd.conf
+          sudo sed -i "s|^\s*#\?\s*Hostname=.*|Hostname=$ZABBIX_HOSTNAME|" /etc/zabbix/zabbix_agentd.conf
+          sudo sed -i "s|^\s*#\?\s*HostMetadata=.*|HostMetadata=$ZABBIX_HOST_METADATA|" /etc/zabbix/zabbix_agentd.conf
+
+          systemctl enable zabbix-agent
+          systemctl start zabbix-agent
+
+  AppEC2InstanceC:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiId
+      SubnetId: !Ref PrivateSubnetC   # プライベートサブネット
+      SecurityGroupIds:
+        - !Ref AppEC2SG
+      IamInstanceProfile: !Ref AppServerInstanceProfile
+      Tags:
+        - Key: Name
+          Value: AppServerC
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          dnf update -y
+          # Install Node.js (example) and Zabbix Agent
+          curl -fsSL https://rpm.nodesource.com/setup_18.x | bash -
+          dnf install -y nodejs mariadb105
+                    
+          # AppRDS 情報を環境変数に永続化
+          echo "export APP_DB_HOST=${AppRDS.Endpoint.Address}" >> /etc/profile.d/app_env.sh
+          echo "export APP_DB_USER=${AppDBAdminUsername}" >> /etc/profile.d/app_env.sh
+          echo "export APP_DB_PASS=${AppDBAdminPassword}" >> /etc/profile.d/app_env.sh
+          echo "export APP_DB_NAME=${AppDBName}" >> /etc/profile.d/app_env.sh
+
+
+          # Node.js アプリ用の .env にも書き込み
+          mkdir -p /home/ec2-user/app
+          cat <<EOF > /home/ec2-user/app/.env
+          DB_HOST=${AppRDS.Endpoint.Address}
+          DB_USER=${AppDBAdminUsername}
+          DB_PASS=${AppDBAdminPassword}
+          DB_NAME=${AppDBName}
+          EOF
+          chown ec2-user:ec2-user /home/ec2-user/app/.env
+
+          # サンプルAPI配置
+          mkdir -p /home/ec2-user/sample-api
+          cat << 'EOF' > /home/ec2-user/sample-api/index.js
+          const http = require('http');
+          const port = 3000;
+          const server = http.createServer((req, res) => {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ message: "Hello World from AppServerC!" }));
+          
+          });
+          server.listen(port, () => {
+          });
+          EOF
+
+
+          # systemdで自動起動
+          cat << 'EOF' > /etc/systemd/system/sample-api.service
+          [Unit]
+          Description=Sample Node.js Hello World API
+          After=network.target
+
+          [Service]
+          ExecStart=/usr/bin/node /home/ec2-user/sample-api/index.js
+          Restart=always
+          User=ec2-user
+          Environment=PATH=/usr/bin:/usr/local/bin
+          WorkingDirectory=/home/ec2-user/sample-api
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          systemctl daemon-reexec
+          systemctl enable sample-api
+          systemctl start sample-api
+
+
+          # Zabbix Agent インストール
+          rpm -Uvh https://repo.zabbix.com/zabbix/7.4/release/amazonlinux/2023/noarch/zabbix-release-latest.amzn2023.noarch.rpm || true
+          dnf clean all || true
+          dnf install -y zabbix-agent || true
+
+            # 固定 EC2 のホスト名
+          ZABBIX_SERVER_IP="${ZabbixServerInstance.PrivateIp}"
+          ZABBIX_HOSTNAME="AppEC2C"           
+          ZABBIX_HOST_METADATA="appserver"
+
+          sudo sed -i "s|^\s*#\?\s*Server=.*|Server=$ZABBIX_SERVER_IP|" /etc/zabbix/zabbix_agentd.conf
+          sudo sed -i "s|^\s*#\?\s*ServerActive=.*|ServerActive=$ZABBIX_SERVER_IP|" /etc/zabbix/zabbix_agentd.conf
+          sudo sed -i "s|^\s*#\?\s*Hostname=.*|Hostname=$ZABBIX_HOSTNAME|" /etc/zabbix/zabbix_agentd.conf
+          sudo sed -i "s|^\s*#\?\s*HostMetadata=.*|HostMetadata=$ZABBIX_HOST_METADATA|" /etc/zabbix/zabbix_agentd.conf
+
+          systemctl enable zabbix-agent
+          systemctl start zabbix-agent
+
+
+
+
+Outputs:
+  ZabbixServerPublicIP:
+    Value: !Ref ZabbixServerEIP
+    Description: Elastic IP of Zabbix Server
+  ZabbixWebUI:
+    Value: !Sub "http://${ZabbixServerEIP}/zabbix"
+    Description: Zabbix Web UI URL
+  AppALBDNS:
+    Value: !GetAtt AppALB.DNSName
+    Description: Application ALB DNS name
